@@ -68,6 +68,11 @@ def fix_bad_values(tensor):
         tensor
     )
 
+# 단위 환산 함수
+def convert_to_meters(cost):
+    """모델 비용을 미터 단위로 변환"""
+    return cost * 1000  # km -> m
+
 # ----------------------------- #
 # 메인 함수
 # ----------------------------- #
@@ -132,7 +137,7 @@ def main():
     if args.resume and os.path.exists(CHECKPOINT):
         print(f"체크포인트 로딩: {CHECKPOINT}")
         try:
-            ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
+            ckpt = torch.load(CHECKPOINT, map_location=DEVICE, weights_only=False)
             model.load_state_dict(ckpt['model'])
             optimizer.load_state_dict(ckpt['optimizer'])
             scheduler.load_state_dict(ckpt['scheduler'])
@@ -147,7 +152,7 @@ def main():
     elif os.path.exists(PRETRAIN):
         print(f"사전학습 모델 로딩: {PRETRAIN}")
         try:
-            pt = torch.load(PRETRAIN, map_location=DEVICE)
+            pt = torch.load(PRETRAIN, map_location=DEVICE, weights_only=False)
             if 'model' in pt:
                 model.load_state_dict(pt['model'])
             else:
@@ -202,16 +207,19 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 
+                # 미터 단위로 변환하여 표시
+                meter_cost = convert_to_meters(cost.mean().item())
+                
                 # 통계 업데이트
                 epoch_loss += loss.item()
-                epoch_reward += -cost.mean().item()
+                epoch_reward += -meter_cost  # 메트릭 단위로 저장
                 processed_batches += 1
                 
                 # 진행률 업데이트
                 train_pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     avg_loss=f"{epoch_loss/processed_batches:.4f}",
-                    reward=f"{-cost.mean().item():.2f}"
+                    reward=f"{-meter_cost:.2f}m"  # 미터 단위로 표시
                 )
             except Exception as e:
                 print(f"\n배치 {batch_idx} 학습 중 오류: {e}")
@@ -226,7 +234,7 @@ def main():
         if processed_batches > 0:
             avg_loss = epoch_loss / processed_batches
             avg_reward = epoch_reward / processed_batches
-            print(f"[에포크 {epoch:3d}] 학습 손실: {avg_loss:.4f} | 보상: {avg_reward:.2f} | 학습률: {optimizer.param_groups[0]['lr']:.2e}")
+            print(f"[에포크 {epoch:3d}] 학습 손실: {avg_loss:.4f} | 보상: {avg_reward:.2f}m | 학습률: {optimizer.param_groups[0]['lr']:.2e}")
         else:
             print(f"[에포크 {epoch:3d}] 경고: 유효한 배치가 없습니다")
         
@@ -257,8 +265,11 @@ def main():
                     # 검증에서는 return_pi=True로 설정하여 경로도 얻음
                     cost, _, pi = model(loc, return_pi=True)
                     
+                    # 미터 단위로 변환
+                    cost_meters = convert_to_meters(cost)
+                    
                     # 유효한 비용만 저장
-                    valid_costs = cost[~torch.isnan(cost) & ~torch.isinf(cost)]
+                    valid_costs = cost_meters[~torch.isnan(cost_meters) & ~torch.isinf(cost_meters)]
                     if len(valid_costs) > 0:
                         val_costs.extend(valid_costs.cpu().numpy())
                 
@@ -271,7 +282,7 @@ def main():
         # 검증 결과 계산
         if val_costs:
             val_cost = np.mean(val_costs)
-            print(f"[에포크 {epoch:3d}] 검증 비용: {val_cost:.2f}")
+            print(f"[에포크 {epoch:3d}] 검증 비용: {val_cost:.2f}m")
             
             # 최고 모델 저장
             if val_cost < best_val_cost:
@@ -281,7 +292,7 @@ def main():
                     'epoch': epoch,
                     'val_cost': val_cost
                 }, BEST_MODEL)
-                print(f"🌟 최고 모델 저장 @에포크{epoch} (검증 비용: {val_cost:.2f})")
+                print(f"🌟 최고 모델 저장 @에포크{epoch} (검증 비용: {val_cost:.2f}m)")
         else:
             print(f"[에포크 {epoch:3d}] 경고: 유효한 검증 결과가 없습니다")
         
@@ -313,7 +324,7 @@ def main():
     
     # 학습 완료
     print("\n" + "="*50)
-    print(f"학습 완료. 최고 검증 비용: {best_val_cost:.2f}")
+    print(f"학습 완료. 최고 검증 비용: {best_val_cost:.2f}m")
     
     # 최종 모델 저장
     torch.save({
