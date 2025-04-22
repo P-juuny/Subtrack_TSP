@@ -29,8 +29,13 @@ class TSP(object):
         return TSPDataset(*args, **kwargs)
 
     @staticmethod
-    def make_state(*args, **kwargs):
-        return StateTSP.initialize(*args, **kwargs)
+    def make_state(input, visited_dtype=torch.uint8):
+        if isinstance(input, dict):  # dict 형태 지원
+            loc = input["loc"]
+        else:
+            loc = input
+        return StateTSP.initialize(loc, visited_dtype=visited_dtype)
+
 
     @staticmethod
     def beam_search(input, beam_size, expand_size=None,

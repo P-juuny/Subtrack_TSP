@@ -71,7 +71,7 @@ def fix_bad_values(tensor):
 # 단위 환산 함수
 def convert_to_meters(cost):
     """모델 비용을 미터 단위로 변환"""
-    return cost # km -> m
+    return cost * 1000  # km -> m
 
 # ----------------------------- #
 # 메인 함수
