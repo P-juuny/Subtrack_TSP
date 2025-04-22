@@ -19,13 +19,15 @@ from define_tsp_road import TSPRoad, RoadDataset
 parser = argparse.ArgumentParser()
 parser.add_argument('--resume', action='store_true')
 parser.add_argument('--checkpoint', type=str, default='checkpoint.pth')
-parser.add_argument('--data_pkl', type=str, default='data/road_TSP_100_fixed.pkl')
+parser.add_argument('--data_pkl', type=str, default='data/road_TSP_100_nozero.pkl')
 parser.add_argument('--pretrain', type=str, default='pretrained/tsp_100/epoch-99.pt')
 parser.add_argument('--out_model', type=str, default='pretrained/final_tsp_road.pt')
 parser.add_argument('--best_model', type=str, default='pretrained/best_tsp_road.pt')
 parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--epochs', type=int, default=300)
 parser.add_argument('--lr', type=float, default=3e-5)
+parser.add_argument('--warmup_epochs', type=int, default=10)
+parser.add_argument('--clip_grad', type=float, default=1.0)
 args = parser.parse_args()
 
 # 기본 설정
@@ -39,10 +41,11 @@ BATCH_SIZE = args.batch_size
 EPOCHS = args.epochs
 LR_INIT = args.lr
 ETA_MIN = 1e-7
-FALLBACK_DIST = 10000.0
+FALLBACK_DIST = 10000.0  # 최대 거리 클리핑 값 (미터 단위) - OSRM은 미터 단위로 반환
 VAL_SPLIT = 0.1
 SEED = 42
-MAX_GRAD_NORM = 1.0
+MAX_GRAD_NORM = args.clip_grad  # 그래디언트 클리핑 값
+WARMUP_EPOCHS = args.warmup_epochs  # 웜업 에포크
 
 # Seed 고정
 random.seed(SEED)
@@ -69,9 +72,38 @@ def fix_bad_values(tensor):
     )
 
 # 단위 환산 함수
-def convert_to_meters(cost):
-    """모델 비용을 미터 단위로 변환"""
-    return cost  # km -> m
+def convert_to_km(meters):
+    """미터 단위 비용을 킬로미터로 변환"""
+    return meters / 1000.0
+
+# ----------------------------- #
+# Learning Rate 스케줄러
+# ----------------------------- #
+class WarmupScheduler:
+    """
+    웜업 후 코사인 스케줄러 적용
+    """
+    def __init__(self, optimizer, warmup_epochs, max_epochs, eta_min=0):
+        self.warmup_epochs = warmup_epochs
+        self.cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs-warmup_epochs, eta_min=eta_min)
+        self.optimizer = optimizer
+        self.eta_min = eta_min
+        self.initial_lr = optimizer.param_groups[0]['lr']
+        self.current_epoch = 0
+    
+    def step(self):
+        self.current_epoch += 1
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup
+            factor = self.current_epoch / self.warmup_epochs
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.eta_min + factor * (self.initial_lr - self.eta_min)
+        else:
+            # Cosine annealing
+            self.cosine_scheduler.step()
+    
+    def get_lr(self):
+        return self.optimizer.param_groups[0]['lr']
 
 # ----------------------------- #
 # 메인 함수
@@ -106,6 +138,28 @@ def main():
         split = int(n_total * VAL_SPLIT)
         train_idx, val_idx = indices[split:], indices[:split]
         
+        # 데이터 전처리 - 평균과 표준편차 계산
+        dist_values = []
+        for idx in range(min(100, n_total)):  # 100개 샘플로 통계 계산
+            sample = full_dataset[idx]
+            dist = sample['dist']
+            dist_values.extend(dist.flatten().tolist())
+        
+        dist_values = np.array(dist_values)
+        dist_values = dist_values[~np.isnan(dist_values) & ~np.isinf(dist_values) & (dist_values > 0)]
+        
+        # 통계 출력
+        mean_dist = np.mean(dist_values)
+        median_dist = np.median(dist_values)
+        min_dist = np.min(dist_values)
+        max_dist = np.max(dist_values)
+        
+        print(f"거리 통계 (미터 단위):")
+        print(f"  - 평균: {mean_dist:.2f}m ({convert_to_km(mean_dist):.2f}km)")
+        print(f"  - 중앙값: {median_dist:.2f}m ({convert_to_km(median_dist):.2f}km)")
+        print(f"  - 최소: {min_dist:.2f}m ({convert_to_km(min_dist):.2f}km)")
+        print(f"  - 최대: {max_dist:.2f}m ({convert_to_km(max_dist):.2f}km)")
+        
         # 데이터 로더
         train_loader = DataLoader(
             Subset(full_dataset, train_idx), 
@@ -123,9 +177,10 @@ def main():
     
     # 4. 옵티마이저 & 스케줄러
     optimizer = Adam(model.parameters(), lr=LR_INIT)
-    scheduler = CosineAnnealingLR(
+    scheduler = WarmupScheduler(
         optimizer, 
-        T_max=EPOCHS, 
+        warmup_epochs=WARMUP_EPOCHS,
+        max_epochs=EPOCHS,
         eta_min=ETA_MIN
     )
     
@@ -137,12 +192,14 @@ def main():
     if args.resume and os.path.exists(CHECKPOINT):
         print(f"체크포인트 로딩: {CHECKPOINT}")
         try:
-            ckpt = torch.load(CHECKPOINT, map_location=DEVICE, weights_only=False)
+            ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
             model.load_state_dict(ckpt['model'])
             optimizer.load_state_dict(ckpt['optimizer'])
-            scheduler.load_state_dict(ckpt['scheduler'])
             best_val_cost = ckpt.get('best_val_cost', float('inf'))
             start_epoch = ckpt.get('epoch', 1) + 1
+            
+            # 스케줄러 복원 (웜업 스케줄러는 상태를 저장하지 않으므로 현재 에포크만 설정)
+            scheduler.current_epoch = start_epoch - 1
             print(f"에포크 {start_epoch}부터 학습 재개")
         except Exception as e:
             print(f"체크포인트 로드 오류: {e}")
@@ -152,7 +209,7 @@ def main():
     elif os.path.exists(PRETRAIN):
         print(f"사전학습 모델 로딩: {PRETRAIN}")
         try:
-            pt = torch.load(PRETRAIN, map_location=DEVICE, weights_only=False)
+            pt = torch.load(PRETRAIN, map_location=DEVICE)
             if 'model' in pt:
                 model.load_state_dict(pt['model'])
             else:
@@ -164,7 +221,11 @@ def main():
     
     # 6. 학습 시작
     print(f"환경: {DEVICE}")
-    print(f"총 {EPOCHS}개 에포크 학습 시작")
+    print(f"총 {EPOCHS}개 에포크 학습 시작 (웜업 {WARMUP_EPOCHS}에포크)")
+    
+    # 학습 진행 기록
+    train_costs_history = []
+    val_costs_history = []
     
     for epoch in range(start_epoch, EPOCHS + 1):
         # 학습 모드
@@ -207,19 +268,18 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 
-                # 미터 단위로 변환하여 표시
-                meter_cost = convert_to_meters(cost.mean().item())
-                
                 # 통계 업데이트
                 epoch_loss += loss.item()
-                epoch_reward += -meter_cost  # 메트릭 단위로 저장
+                # costs는 이미 미터 단위
+                cost_m = cost.mean().item()
+                epoch_reward += -cost_m  # 메트릭 단위로 저장
                 processed_batches += 1
                 
                 # 진행률 업데이트
                 train_pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     avg_loss=f"{epoch_loss/processed_batches:.4f}",
-                    reward=f"{-meter_cost:.2f}m"  # 미터 단위로 표시
+                    reward=f"{-cost_m:.2f}m ({convert_to_km(-cost_m):.2f}km)"  # 킬로미터 및 미터 단위로 표시
                 )
             except Exception as e:
                 print(f"\n배치 {batch_idx} 학습 중 오류: {e}")
@@ -234,7 +294,11 @@ def main():
         if processed_batches > 0:
             avg_loss = epoch_loss / processed_batches
             avg_reward = epoch_reward / processed_batches
-            print(f"[에포크 {epoch:3d}] 학습 손실: {avg_loss:.4f} | 보상: {avg_reward:.2f}m | 학습률: {optimizer.param_groups[0]['lr']:.2e}")
+            train_costs_history.append(-avg_reward)  # 비용은 음수 보상
+            
+            print(f"[에포크 {epoch:3d}] 학습 손실: {avg_loss:.4f} | " 
+                  f"비용: {-avg_reward:.2f}m ({convert_to_km(-avg_reward):.2f}km) | "
+                  f"학습률: {scheduler.get_lr():.2e}")
         else:
             print(f"[에포크 {epoch:3d}] 경고: 유효한 배치가 없습니다")
         
@@ -263,14 +327,10 @@ def main():
                     
                     # 검증을 위한 비용 계산
                     # 검증에서는 return_pi=True로 설정하여 경로도 얻음
-                    batch_input = {'loc': loc, 'dist': dist}
                     cost, _, pi = model(batch_input, return_pi=True)
                     
-                    # 미터 단위로 변환
-                    cost_meters = convert_to_meters(cost)
-                    
-                    # 유효한 비용만 저장
-                    valid_costs = cost_meters[~torch.isnan(cost_meters) & ~torch.isinf(cost_meters)]
+                    # 유효한 비용만 저장 (이미 미터 단위)
+                    valid_costs = cost[~torch.isnan(cost) & ~torch.isinf(cost)]
                     if len(valid_costs) > 0:
                         val_costs.extend(valid_costs.cpu().numpy())
                 
@@ -283,7 +343,8 @@ def main():
         # 검증 결과 계산
         if val_costs:
             val_cost = np.mean(val_costs)
-            print(f"[에포크 {epoch:3d}] 검증 비용: {val_cost:.2f}m")
+            val_costs_history.append(val_cost)
+            print(f"[에포크 {epoch:3d}] 검증 비용: {val_cost:.2f}m ({convert_to_km(val_cost):.2f}km)")
             
             # 최고 모델 저장
             if val_cost < best_val_cost:
@@ -291,19 +352,31 @@ def main():
                 torch.save({
                     'model': model.state_dict(),
                     'epoch': epoch,
-                    'val_cost': val_cost
+                    'val_cost': val_cost,
+                    'val_cost_km': convert_to_km(val_cost)
                 }, BEST_MODEL)
-                print(f"🌟 최고 모델 저장 @에포크{epoch} (검증 비용: {val_cost:.2f}m)")
+                print(f"🌟 최고 모델 저장 @에포크{epoch} (검증 비용: {val_cost:.2f}m, {convert_to_km(val_cost):.2f}km)")
         else:
             print(f"[에포크 {epoch:3d}] 경고: 유효한 검증 결과가 없습니다")
+        
+        # 에포크 진행 그래프 (10 에포크마다)
+        if epoch % 10 == 0 and len(train_costs_history) > 0:
+            print(f"\n===== 학습 진행 상황 (에포크 {epoch}) =====")
+            print(f"최근 10 에포크 평균 학습 비용: {np.mean(train_costs_history[-10:]):.2f}m ({convert_to_km(np.mean(train_costs_history[-10:])):.2f}km)")
+            if len(val_costs_history) > 0:
+                print(f"최근 10 에포크 평균 검증 비용: {np.mean(val_costs_history[-10:]):.2f}m ({convert_to_km(np.mean(val_costs_history[-10:])):.2f}km)")
+                print(f"현재 최고 검증 비용: {best_val_cost:.2f}m ({convert_to_km(best_val_cost):.2f}km)")
+            print("=" * 40)
         
         # 체크포인트 저장
         torch.save({
             'epoch': epoch,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'best_val_cost': best_val_cost
+            'best_val_cost': best_val_cost,
+            'best_val_cost_km': convert_to_km(best_val_cost),
+            'train_costs_history': train_costs_history,
+            'val_costs_history': val_costs_history
         }, CHECKPOINT)
         
         # 주기적 체크포인트 저장
@@ -318,20 +391,25 @@ def main():
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_val_cost': best_val_cost
+                'best_val_cost': best_val_cost,
+                'best_val_cost_km': convert_to_km(best_val_cost),
+                'train_costs_history': train_costs_history,
+                'val_costs_history': val_costs_history
             }, cp_path)
             print(f"📝 에포크 {epoch} 체크포인트 저장")
     
     # 학습 완료
     print("\n" + "="*50)
-    print(f"학습 완료. 최고 검증 비용: {best_val_cost:.2f}m")
+    print(f"학습 완료. 최고 검증 비용: {best_val_cost:.2f}m ({convert_to_km(best_val_cost):.2f}km)")
     
     # 최종 모델 저장
     torch.save({
         'model': model.state_dict(),
         'best_val_cost': best_val_cost,
-        'final_epoch': EPOCHS
+        'best_val_cost_km': convert_to_km(best_val_cost),
+        'final_epoch': EPOCHS,
+        'train_costs_history': train_costs_history,
+        'val_costs_history': val_costs_history
     }, OUT_MODEL)
     
     print(f"✅ 최종 모델 저장 완료: {OUT_MODEL}")
