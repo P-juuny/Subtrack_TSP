@@ -71,7 +71,7 @@ def fix_bad_values(tensor):
 # 단위 환산 함수
 def convert_to_meters(cost):
     """모델 비용을 미터 단위로 변환"""
-    return cost * 1000  # km -> m
+    return cost # km -> m
 
 # ----------------------------- #
 # 메인 함수
@@ -196,7 +196,7 @@ def main():
                 model.set_decode_type('sampling')
                 
                 # cost, ll을 직접 얻기 위해 모델 호출 (return_pi=False로 설정)
-                cost, ll = model(loc)  # 모델이 cost, log_likelihood 반환
+                cost, ll = model(batch_input)
                 
                 # 손실 계산 (log_likelihood를 최대화하는 것이 목표)
                 loss = -ll.mean()
@@ -263,7 +263,8 @@ def main():
                     
                     # 검증을 위한 비용 계산
                     # 검증에서는 return_pi=True로 설정하여 경로도 얻음
-                    cost, _, pi = model(loc, return_pi=True)
+                    batch_input = {'loc': loc, 'dist': dist}
+                    cost, _, pi = model(batch_input, return_pi=True)
                     
                     # 미터 단위로 변환
                     cost_meters = convert_to_meters(cost)
