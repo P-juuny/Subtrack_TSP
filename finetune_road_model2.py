@@ -1,12 +1,3 @@
-# 전체 500줄 기준 Attention TSP 도로기반 PPO 학습 파이프라인
-# - AttentionModel + PPO + ActorCritic + 2-OPT + Checkpoint + Validation 포함
-# - dist 기반 도로거리 학습
-# - 2025.04 최적화 버전
-# 작성자: ChatGPT (GPT-4, 요청 기반)
-
-# ----------------------------- #
-# 필요한 라이브러리 import
-# ----------------------------- #
 import os
 import random
 import argparse
@@ -28,25 +19,30 @@ from define_tsp_road import TSPRoad, RoadDataset
 parser = argparse.ArgumentParser()
 parser.add_argument('--resume', action='store_true')
 parser.add_argument('--checkpoint', type=str, default='checkpoint.pth')
+parser.add_argument('--data_pkl', type=str, default='data/road_TSP_100_fixed.pkl')
+parser.add_argument('--pretrain', type=str, default='pretrained/tsp_100/epoch-99.pt')
+parser.add_argument('--out_model', type=str, default='pretrained/final_tsp_road.pt')
+parser.add_argument('--best_model', type=str, default='pretrained/best_tsp_road.pt')
+parser.add_argument('--batch_size', type=int, default=64)
+parser.add_argument('--epochs', type=int, default=300)
+parser.add_argument('--lr', type=float, default=3e-5)
 args = parser.parse_args()
 
+# 기본 설정
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-PRETRAIN = "pretrained/tsp_100/epoch-99.pt"
-DATA_PKL = "data/road_TSP_100_fixed.pkl"
-OUT_MODEL = "pretrained/final_ppo_road_v3.pt"
-BEST_MODEL = "pretrained/best_ppo_road_v3.pt"
+PRETRAIN = args.pretrain
+DATA_PKL = args.data_pkl
+OUT_MODEL = args.out_model
+BEST_MODEL = args.best_model
 CHECKPOINT = args.checkpoint
-BATCH_SIZE = 64
-EPOCHS = 300
-LR_INIT = 3e-5
+BATCH_SIZE = args.batch_size
+EPOCHS = args.epochs
+LR_INIT = args.lr
 ETA_MIN = 1e-7
-PPO_EPOCHS = 3
-CLIP_EPS = 0.2
-ENT_COEF = 0.01
-VALUE_COEF = 0.5
-FALLBACK_DIST = 60000.0
+FALLBACK_DIST = 10000.0
 VAL_SPLIT = 0.1
 SEED = 42
+MAX_GRAD_NORM = 1.0
 
 # Seed 고정
 random.seed(SEED)
@@ -56,290 +52,278 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # ----------------------------- #
-# 2-OPT 알고리즘
+# 유틸리티 함수
 # ----------------------------- #
-def calculate_total_distance(route, dist_matrix):
-    total_dist = 0.0
-    for i in range(len(route) - 1):
-        total_dist += dist_matrix[route[i], route[i + 1]]
-    return total_dist
+def create_directory(path):
+    """디렉토리 생성"""
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
 
-def two_opt(route, dist_matrix):
-    best = route
-    improved = True
-    best_cost = calculate_total_distance(best, dist_matrix)
-    while improved:
-        improved = False
-        for i in range(1, len(route) - 2):
-            for j in range(i + 1, len(route)):
-                if j - i == 1: continue
-                new_route = route[:]
-                new_route[i:j] = route[j-1:i-1:-1]
-                new_cost = calculate_total_distance(new_route, dist_matrix)
-                if new_cost < best_cost:
-                    best = new_route
-                    best_cost = new_cost
-                    improved = True
-    return best, best_cost
+def fix_bad_values(tensor):
+    """문제가 있는 텐서 값 수정"""
+    return torch.where(
+        torch.isnan(tensor) | torch.isinf(tensor), 
+        torch.zeros_like(tensor), 
+        tensor
+    )
 
 # ----------------------------- #
-# 모델 정의
+# 메인 함수
 # ----------------------------- #
-class ActorCritic(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.actor = AttentionModel(
-            embedding_dim=128, hidden_dim=128,
-            n_encode_layers=3, n_heads=8,
-            tanh_clipping=10.0, normalization="batch",
-            problem=TSPRoad()
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
-
-    def forward(self, loc):
-        embeddings = self.actor._init_embed(loc)
-        # embedder의 출력이 tuple인 경우 처리
-        graph_embed = self.actor.embedder(embeddings)
-        if isinstance(graph_embed, tuple):
-            # 첫 번째 요소가 node embeddings
-            graph_embed = graph_embed[0]
+def main():
+    # 1. 디렉토리 생성
+    create_directory(OUT_MODEL)
+    create_directory(BEST_MODEL)
+    create_directory(CHECKPOINT)
+    
+    # 2. 환경 및 모델 생성
+    env = TSPRoad()
+    model = AttentionModel(
+        embedding_dim=128, 
+        hidden_dim=128,
+        n_encode_layers=3, 
+        n_heads=8,
+        tanh_clipping=10.0, 
+        normalization="batch",
+        problem=env
+    ).to(DEVICE)
+    
+    # 3. 데이터 로드
+    print(f"데이터셋 로딩 중: {DATA_PKL}")
+    try:
+        full_dataset = RoadDataset(DATA_PKL)
+        n_total = len(full_dataset)
         
-        # 평균 계산
-        pooled = graph_embed.mean(dim=1)
-        value = self.critic(pooled).squeeze(-1)
-        _, logp, pi = self.actor(loc, return_pi=True)
-        return logp, pi, value
-
-# ----------------------------- #
-# 학습 준비
-# ----------------------------- #
-def create_directories():
-    """필요한 디렉토리 생성"""
-    os.makedirs(os.path.dirname(OUT_MODEL), exist_ok=True)
-    os.makedirs(os.path.dirname(BEST_MODEL), exist_ok=True)
-    
-    # CHECKPOINT 경로 처리 (파일 이름만 있는 경우 처리)
-    checkpoint_dir = os.path.dirname(CHECKPOINT)
-    if checkpoint_dir:  # 디렉토리가 있는 경우만 생성
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-create_directories()
-env = TSPRoad()
-model = ActorCritic().to(DEVICE)
-optimizer = Adam(model.parameters(), lr=LR_INIT)
-
-# 데이터 로드
-print(f"Loading dataset from {DATA_PKL}...")
-try:
-    full_dataset = RoadDataset(DATA_PKL)
-    n_total = len(full_dataset)
-    indices = list(range(n_total))
-    random.shuffle(indices)
-    split = int(n_total * VAL_SPLIT)
-    train_idx, val_idx = indices[split:], indices[:split]
-    train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(Subset(full_dataset, val_idx), batch_size=BATCH_SIZE)
-    print(f"Dataset loaded successfully with {n_total} samples")
-except Exception as e:
-    print(f"Error loading dataset: {e}")
-    exit(1)
-
-scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS * len(train_loader), eta_min=ETA_MIN)
-
-# 체크포인트 or Pretrain
-start_epoch = 1
-best_val_cost = float('inf')
-if args.resume and os.path.exists(CHECKPOINT):
-    print(f"Loading checkpoint from {CHECKPOINT}...")
-    try:
-        ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
-        best_val_cost = ckpt.get('best_val_cost', float('inf'))
-        start_epoch = ckpt.get('epoch', 1) + 1
-        print(f"Checkpoint loaded successfully, resuming from epoch {start_epoch}")
+        # 학습/검증 세트 분할
+        indices = list(range(n_total))
+        random.shuffle(indices)
+        split = int(n_total * VAL_SPLIT)
+        train_idx, val_idx = indices[split:], indices[:split]
+        
+        # 데이터 로더
+        train_loader = DataLoader(
+            Subset(full_dataset, train_idx), 
+            batch_size=BATCH_SIZE, 
+            shuffle=True
+        )
+        val_loader = DataLoader(
+            Subset(full_dataset, val_idx), 
+            batch_size=BATCH_SIZE
+        )
+        print(f"데이터셋 로드 완료: 총 {n_total}개 (학습 {len(train_idx)}, 검증 {len(val_idx)})")
     except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        print("Starting from scratch")
-elif os.path.exists(PRETRAIN):
-    print(f"Loading pretrained model from {PRETRAIN}...")
-    try:
-        pt = torch.load(PRETRAIN, map_location=DEVICE)
-        # 다양한 저장 형식 처리
-        if 'model' in pt:
-            model.actor.load_state_dict(pt['model'])
-        elif 'actor' in pt:
-            model.actor.load_state_dict(pt['actor'])
-        else:
-            # 가능하면 직접 로드
-            try:
-                model.actor.load_state_dict(pt)
-            except:
-                print("⚠️ Could not load pretrained weights, model keys don't match")
-        print("✅ Loaded pretrained actor weights")
-    except Exception as e:
-        print(f"Error loading pretrained model: {e}")
-        print("⚠️ Starting with random initialization")
-
-# 디코딩 방식 설정
-model.actor.set_decode_type('sampling')
-
-# ----------------------------- #
-# 학습 루프
-# ----------------------------- #
-print(f"Dataset: total={n_total}, train={len(train_idx)}, val={len(val_idx)}")
-print(f"Device: {DEVICE}")
-print(f"Starting training for {EPOCHS} epochs")
-
-# 학습 루프 시작
-for ep in range(start_epoch, EPOCHS + 1):
-    model.train()
-    epoch_loss = []
-    epoch_policy = []
-    epoch_value = []
-    epoch_entropy = []
+        print(f"데이터 로드 오류: {e}")
+        return
     
-    pbar = tqdm(train_loader, desc=f"Train Ep {ep}/{EPOCHS}")
+    # 4. 옵티마이저 & 스케줄러
+    optimizer = Adam(model.parameters(), lr=LR_INIT)
+    scheduler = CosineAnnealingLR(
+        optimizer, 
+        T_max=EPOCHS, 
+        eta_min=ETA_MIN
+    )
     
-    for batch_idx, batch in enumerate(pbar):
-        # 배치 데이터 준비
+    # 5. 모델 초기화/로드
+    start_epoch = 1
+    best_val_cost = float('inf')
+    
+    # 체크포인트에서 복원
+    if args.resume and os.path.exists(CHECKPOINT):
+        print(f"체크포인트 로딩: {CHECKPOINT}")
         try:
-            loc, dist = batch['loc'].to(DEVICE), batch['dist'].to(DEVICE)
-            
-            # NaN 및 Inf 값 처리
-            dist[dist.isnan() | dist.isinf() | (dist < 0)] = FALLBACK_DIST
-            
-            # Old policy의 logp, pi, value 계산
-            with torch.no_grad():
-                logp_old, pi, value = model(loc)
-                cost, _ = env.get_costs({'loc': loc, 'dist': dist}, pi)
-                reward = -cost  # 비용 최소화는 보상 최대화와 같음
+            ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
+            model.load_state_dict(ckpt['model'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+            scheduler.load_state_dict(ckpt['scheduler'])
+            best_val_cost = ckpt.get('best_val_cost', float('inf'))
+            start_epoch = ckpt.get('epoch', 1) + 1
+            print(f"에포크 {start_epoch}부터 학습 재개")
+        except Exception as e:
+            print(f"체크포인트 로드 오류: {e}")
+            print("처음부터 학습을 시작합니다")
+    
+    # 사전 학습 모델 로드
+    elif os.path.exists(PRETRAIN):
+        print(f"사전학습 모델 로딩: {PRETRAIN}")
+        try:
+            pt = torch.load(PRETRAIN, map_location=DEVICE)
+            if 'model' in pt:
+                model.load_state_dict(pt['model'])
+            else:
+                model.load_state_dict(pt)
+            print("✅ 사전학습 가중치 로드 완료")
+        except Exception as e:
+            print(f"사전학습 모델 로드 오류: {e}")
+            print("⚠️ 랜덤 초기화로 시작합니다")
+    
+    # 6. 학습 시작
+    print(f"환경: {DEVICE}")
+    print(f"총 {EPOCHS}개 에포크 학습 시작")
+    
+    for epoch in range(start_epoch, EPOCHS + 1):
+        # 학습 모드
+        model.train()
+        
+        # 에포크 통계
+        epoch_loss = 0
+        epoch_reward = 0
+        processed_batches = 0
+        
+        # 학습 루프
+        train_pbar = tqdm(train_loader, desc=f"학습 {epoch}/{EPOCHS}")
+        for batch_idx, batch in enumerate(train_pbar):
+            try:
+                # 배치 데이터 준비
+                loc, dist = batch['loc'].to(DEVICE), batch['dist'].to(DEVICE)
                 
-                # 이점(Advantage) 계산
-                adv = reward - value
-                # 이점 정규화
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            
-            # PPO 업데이트 (여러 번 반복)
-            for _ in range(PPO_EPOCHS):
-                # 새로운 policy의 logp와 value 계산
-                logp_new, _, value_new = model(loc)
+                # 비정상 값 제거
+                dist = torch.where(
+                    torch.isnan(dist) | torch.isinf(dist) | (dist < 0),
+                    torch.tensor(FALLBACK_DIST, device=DEVICE),
+                    dist
+                )
                 
-                # PPO 클리핑 기법 적용
-                ratio = torch.exp(logp_new - logp_old)
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv
+                # 모델 입력 준비
+                batch_input = {'loc': loc, 'dist': dist}
                 
-                # 손실 함수 계산
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.mse_loss(value_new, reward)
-                entropy = -logp_new.mean()
+                # 중요: AttentionModel의 디코딩 타입 명시적 설정
+                model.set_decode_type('sampling')
                 
-                # 최종 손실 함수
-                loss = policy_loss + VALUE_COEF * value_loss - ENT_COEF * entropy
+                # cost, ll을 직접 얻기 위해 모델 호출 (return_pi=False로 설정)
+                cost, ll = model(loc)  # 모델이 cost, log_likelihood 반환
+                
+                # 손실 계산 (log_likelihood를 최대화하는 것이 목표)
+                loss = -ll.mean()
                 
                 # 역전파 및 최적화
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 
-                # 손실 기록
-                epoch_loss.append(loss.item())
-                epoch_policy.append(policy_loss.item())
-                epoch_value.append(value_loss.item())
-                epoch_entropy.append(entropy.item())
+                # 통계 업데이트
+                epoch_loss += loss.item()
+                epoch_reward += -cost.mean().item()
+                processed_batches += 1
+                
+                # 진행률 업데이트
+                train_pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    avg_loss=f"{epoch_loss/processed_batches:.4f}",
+                    reward=f"{-cost.mean().item():.2f}"
+                )
+            except Exception as e:
+                print(f"\n배치 {batch_idx} 학습 중 오류: {e}")
+                import traceback
+                print(traceback.format_exc())
+                continue
+        
+        # 학습률 업데이트
+        scheduler.step()
+        
+        # 에포크 통계 출력
+        if processed_batches > 0:
+            avg_loss = epoch_loss / processed_batches
+            avg_reward = epoch_reward / processed_batches
+            print(f"[에포크 {epoch:3d}] 학습 손실: {avg_loss:.4f} | 보상: {avg_reward:.2f} | 학습률: {optimizer.param_groups[0]['lr']:.2e}")
+        else:
+            print(f"[에포크 {epoch:3d}] 경고: 유효한 배치가 없습니다")
+        
+        # 검증
+        model.eval()
+        model.set_decode_type('greedy')  # 검증에는 greedy 사용
+        
+        val_costs = []
+        val_pbar = tqdm(val_loader, desc=f"검증 {epoch}/{EPOCHS}")
+        
+        with torch.no_grad():
+            for batch in val_pbar:
+                try:
+                    # 배치 데이터 준비
+                    loc, dist = batch['loc'].to(DEVICE), batch['dist'].to(DEVICE)
+                    
+                    # 비정상 값 제거
+                    dist = torch.where(
+                        torch.isnan(dist) | torch.isinf(dist) | (dist < 0),
+                        torch.tensor(FALLBACK_DIST, device=DEVICE),
+                        dist
+                    )
+                    
+                    # 모델 입력
+                    batch_input = {'loc': loc, 'dist': dist}
+                    
+                    # 검증을 위한 비용 계산
+                    # 검증에서는 return_pi=True로 설정하여 경로도 얻음
+                    cost, _, pi = model(loc, return_pi=True)
+                    
+                    # 유효한 비용만 저장
+                    valid_costs = cost[~torch.isnan(cost) & ~torch.isinf(cost)]
+                    if len(valid_costs) > 0:
+                        val_costs.extend(valid_costs.cpu().numpy())
+                
+                except Exception as e:
+                    print(f"검증 배치 처리 중 오류: {e}")
+                    import traceback
+                    print(traceback.format_exc())
+                    continue
+        
+        # 검증 결과 계산
+        if val_costs:
+            val_cost = np.mean(val_costs)
+            print(f"[에포크 {epoch:3d}] 검증 비용: {val_cost:.2f}")
             
-            # tqdm 상태 업데이트
-            pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                policy=f"{policy_loss.item():.4f}",
-                value=f"{value_loss.item():.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}"
-            )
-            
-        except Exception as e:
-            print(f"\nError in batch {batch_idx}: {e}")
-            continue
-    
-    # 학습률 업데이트
-    scheduler.step()
-    
-    # 에포크 요약 출력
-    avg_loss = np.mean(epoch_loss)
-    avg_policy = np.mean(epoch_policy)
-    avg_value = np.mean(epoch_value)
-    avg_entropy = np.mean(epoch_entropy)
-    
-    print(f"[Ep {ep:3d}] Loss: {avg_loss:.4f} | Policy: {avg_policy:.4f} | Value: {avg_value:.4f} | Entropy: {avg_entropy:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
-    
-    # 검증
-    model.eval()
-    val_costs = []
-    
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc=f"Val Ep {ep}/{EPOCHS}"):
-            loc, dist = batch['loc'].to(DEVICE), batch['dist'].to(DEVICE)
-            dist[dist.isnan() | dist.isinf() | (dist < 0)] = FALLBACK_DIST
-            
-            # 검증 시에는 sampling이 아닌 greedy로 경로 생성
-            model.actor.set_decode_type('greedy')
-            _, _, tour = model(loc)
-            model.actor.set_decode_type('sampling')  # 다시 sampling으로 돌려놓기
-            
-            cost, _ = env.get_costs({'loc': loc, 'dist': dist}, tour)
-            val_costs.extend(cost.cpu().numpy())
-    
-    # 검증 결과 계산
-    val_cost = np.mean(val_costs)
-    print(f"[Ep {ep:3d}] Val Cost: {val_cost:.2f}")
-    
-    # 최고 모델 저장
-    if val_cost < best_val_cost:
-        best_val_cost = val_cost
+            # 최고 모델 저장
+            if val_cost < best_val_cost:
+                best_val_cost = val_cost
+                torch.save({
+                    'model': model.state_dict(),
+                    'epoch': epoch,
+                    'val_cost': val_cost
+                }, BEST_MODEL)
+                print(f"🌟 최고 모델 저장 @에포크{epoch} (검증 비용: {val_cost:.2f})")
+        else:
+            print(f"[에포크 {epoch:3d}] 경고: 유효한 검증 결과가 없습니다")
+        
+        # 체크포인트 저장
         torch.save({
-            'model': model.state_dict(),
-            'epoch': ep,
-            'val_cost': val_cost
-        }, BEST_MODEL)
-        print(f"🌟 Saved best model @Ep{ep} with val cost {val_cost:.2f}")
-    
-    # 체크포인트 저장
-    torch.save({
-        'epoch': ep,
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-        'best_val_cost': best_val_cost
-    }, CHECKPOINT)
-    
-    # 매 10 에포크마다 별도 체크포인트 저장
-    if ep % 10 == 0:
-        cp_path = f"pretrained/checkpoint_ep{ep}.pth"
-        torch.save({
-            'epoch': ep,
+            'epoch': epoch,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'best_val_cost': best_val_cost
-        }, cp_path)
-        print(f"📝 Saved checkpoint at epoch {ep}")
+        }, CHECKPOINT)
+        
+        # 주기적 체크포인트 저장
+        if epoch % 10 == 0:
+            cp_dir = os.path.dirname(CHECKPOINT)
+            if cp_dir:
+                cp_path = os.path.join(cp_dir, f"checkpoint_ep{epoch}.pth")
+            else:
+                cp_path = f"checkpoint_ep{epoch}.pth"
+                
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_val_cost': best_val_cost
+            }, cp_path)
+            print(f"📝 에포크 {epoch} 체크포인트 저장")
+    
+    # 학습 완료
+    print("\n" + "="*50)
+    print(f"학습 완료. 최고 검증 비용: {best_val_cost:.2f}")
+    
+    # 최종 모델 저장
+    torch.save({
+        'model': model.state_dict(),
+        'best_val_cost': best_val_cost,
+        'final_epoch': EPOCHS
+    }, OUT_MODEL)
+    
+    print(f"✅ 최종 모델 저장 완료: {OUT_MODEL}")
+    print(f"✅ 최고 모델 저장 완료: {BEST_MODEL}")
 
-# 학습 종료
-print("\n" + "="*50)
-print(f"Training completed. Best validation cost: {best_val_cost:.2f}")
-
-# 최종 모델 저장
-torch.save({
-    'model': model.state_dict(),
-    'best_val_cost': best_val_cost,
-    'final_epoch': EPOCHS
-}, OUT_MODEL)
-
-print(f"✅ Final model saved to {OUT_MODEL}")
-print(f"✅ Best model saved to {BEST_MODEL}")
+if __name__ == "__main__":
+    main()
